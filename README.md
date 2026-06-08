@@ -42,7 +42,7 @@ Total elapsed time             : 1.172 s
 ```shell
 $ cargo run --release -- --spill
 Writing 8192 rows × 18 columns (3 int, 5 small-string ~20B, 10 large-string ~16 KiB)
-Page buffering                 : TempFilePageStore (spilling to temp files)
+Page buffering                 : SpillingPageStore (all pages to one shared temp file)
 Rows written                   : 8192 rows
 Peak ArrowWriter::memory_size(): 13.4 MiB   <- bytes the writer held on the heap
 Total elapsed time             : 1.336 s
@@ -63,15 +63,36 @@ for wide schemas or columns with large (e.g. string / image) values.
 ## PageStore
 
 To avoid buffering an entire row group in memory, the Parquet writer can be
-configured to use a [`PageStore`] for buffering the encoded pages. This example
-writes encoded pages to temp files before writing the final Parquet file, but a
-`PageStore` could also be used to buffer pages in memory, write them to a remote
-object store, or dynamically spill to disk once a memory threshold is exceeded,
-and more.
+configured to use a [`PageStore`] for buffering the encoded pages. The store
+factory is invoked once per column chunk, but the factory itself is shared, so
+the per-column stores can share state: this example appends every spilled page to
+a *single* temp file (one file descriptor for the whole writer, not one per
+column) and addresses pages by their `(offset, len)`. A `PageStore` could equally
+buffer pages in memory, write them to a remote object store, and more.
+
+`--mem-budget-mb` shows the dynamic case: keep pages in memory up to a budget
+shared across all columns and spill only the overflow, so a write that fits the
+budget pays no I/O at all.
 
 Nothing comes for free, of course: using a `PageStore` writes the bytes one extra
 time — both to and from the store. Those bytes are efficiently encoded Parquet
 data pages, though, not the original input data.
+
+## Write overhead
+
+Spilling sends every page through the store an extra time, so it is slower than
+the default in-memory path. Measured here (median of interleaved runs, 30,000
+rows × 18 columns, ≈4.6 GiB spilled):
+
+| Spilling store    | Elapsed | vs. no-spill |
+|-------------------|---------|--------------|
+| none (in-memory)  | 2.52 s  | —            |
+| temp-file spill   | 2.90 s  | +15%         |
+
+That ~15% is mostly the unavoidable cost of writing the encoded pages out and
+reading them back. Coalescing the writes/reads through a buffer doesn't help:
+bounded data pages are already ~0.5 MiB, and one buffer per column would cost
+real memory on wide schemas.
 
 ## Running
 
@@ -82,6 +103,10 @@ cargo run --release
 
 # Spill completed pages to temp files: peak writer memory stays bounded.
 cargo run --release -- --spill
+
+# Keep pages in memory up to a shared budget (across all columns), spilling only
+# the overflow: writes that fit the budget pay no I/O, larger ones stay bounded.
+cargo run --release -- --mem-budget-mb 128
 
 # Make the schema wider / the skew worse:
 cargo run --release -- --spill --large-string-columns 40
